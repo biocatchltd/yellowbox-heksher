@@ -22,7 +22,7 @@ class HeksherService(SingleEndpointService, RunMixin):
 
         self.heksher = creator.create_and_pull(
             heksher_image, publish_all_ports=True, ports={80: port}, detach=True, environment={
-                'HEKSHER_DB_CONNECTION_STRING': 'postgresql://postgres:guest@postgres/heksher',
+                'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
                 'HEKSHER_STARTUP_CONTEXT_FEATURES': heksher_startup_context_features,
             }
         )
@@ -95,7 +95,7 @@ class HeksherService(SingleEndpointService, RunMixin):
     async def clear(self):
         settings_names = await self.get_setting_names()
         rules = await self.get_rules(settings_names)
-        rules_ids = [rule["rule_id"] for _ in rules.values() for rule in _]
+        rules_ids = [rule["rule_id"] for config_rules in rules.values() for rule in config_rules]
         for rule_id in rules_ids:
             (await self.http_client.delete(f'/api/v1/rules/{rule_id}')).raise_for_status()
         for setting_name in settings_names:
