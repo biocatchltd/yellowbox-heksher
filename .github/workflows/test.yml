@@ -7,7 +7,7 @@ on:
     branches: [ master ]
 
 jobs:
-  unittest:
+  tests:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -39,7 +39,7 @@ jobs:
       uses: codecov/codecov-action@v1
       with:
         file: ./coverage.xml
-        flags: unittests
+        flags: tests
     - name: Lint
       run: |
         poetry run sh scripts/lint.sh
