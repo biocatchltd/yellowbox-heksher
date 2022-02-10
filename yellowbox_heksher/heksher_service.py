@@ -1,3 +1,4 @@
+from asyncio import get_event_loop
 from typing import List, Optional, Sequence
 
 import httpx
@@ -14,11 +15,18 @@ from yellowbox.utils import docker_host_name
 
 class HeksherService(SingleEndpointService, RunMixin):
     def __init__(self, docker_client: DockerClient, postgres_image: str = 'postgres:latest',
-                 heksher_image: str = 'biocatchltd/heksher:0.3.0', port: int = 0, *,
+                 heksher_image: str = 'biocatchltd/heksher:0.4.1', port: int = 0, *,
                  heksher_startup_context_features: str, **kwargs):
         creator = SafeContainerCreator(docker_client)
 
         self.postgres_service = PostgreSQLService(docker_client, image=postgres_image, default_db='heksher')
+
+        self.heksher_db_migrator = creator.create_and_pull(
+            heksher_image, "alembic upgrade head", publish_all_ports=True, ports={80: port}, detach=True, environment={
+                'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
+                'HEKSHER_STARTUP_CONTEXT_FEATURES': heksher_startup_context_features,
+            }
+        )
 
         self.heksher = creator.create_and_pull(
             heksher_image, publish_all_ports=True, ports={80: port}, detach=True, environment={
@@ -26,12 +34,14 @@ class HeksherService(SingleEndpointService, RunMixin):
                 'HEKSHER_STARTUP_CONTEXT_FEATURES': heksher_startup_context_features,
             }
         )
+
         self.http_client: Optional[httpx.AsyncClient] = None
 
         self.network = anonymous_network(docker_client)
         self.postgres_service.connect(self.network, aliases=['postgres'])
         self.network.connect(self.heksher, aliases=['heksher'])
-        super().__init__((self.heksher, ), **kwargs)
+        self.network.connect(self.heksher_db_migrator, aliases=['heksher-db-migrator'])
+        super().__init__((self.heksher_db_migrator, self.heksher), **kwargs)
 
     def start(self, retry_spec: Optional[RetrySpec] = None):
         self.postgres_service.start()
@@ -45,12 +55,14 @@ class HeksherService(SingleEndpointService, RunMixin):
         return self
 
     def stop(self, signal='SIGKILL'):
-        self.http_client.aclose()
+        get_event_loop().run_until_complete(self.http_client.aclose())
         # difference in default signal
         self.postgres_service.disconnect(self.network)
         self.network.disconnect(self.heksher)
+        self.network.disconnect(self.heksher_db_migrator)
         self.network.remove()
         self.postgres_service.stop(signal)
+        self.heksher_db_migrator.remove(v=True)
         super().stop(signal)
 
     @property
