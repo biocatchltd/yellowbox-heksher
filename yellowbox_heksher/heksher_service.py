@@ -17,18 +17,12 @@ class HeksherService(SingleEndpointService, RunMixin):
     def __init__(self, docker_client: DockerClient, postgres_image: str = 'postgres:latest',
                  heksher_image: str = 'biocatchltd/heksher:0.4.1', port: int = 0, *,
                  heksher_startup_context_features: str, **kwargs):
-        creator = SafeContainerCreator(docker_client)
+        self.heksher_image = heksher_image
+        self.container_creator = SafeContainerCreator(docker_client)
 
         self.postgres_service = PostgreSQLService(docker_client, image=postgres_image, default_db='heksher')
 
-        self.heksher_db_migrator = creator.create_and_pull(
-            heksher_image, "alembic upgrade head", publish_all_ports=True, ports={80: port}, detach=True, environment={
-                'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
-                'HEKSHER_STARTUP_CONTEXT_FEATURES': heksher_startup_context_features,
-            }
-        )
-
-        self.heksher = creator.create_and_pull(
+        self.heksher = self.container_creator.create_and_pull(
             heksher_image, publish_all_ports=True, ports={80: port}, detach=True, environment={
                 'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
                 'HEKSHER_STARTUP_CONTEXT_FEATURES': heksher_startup_context_features,
@@ -40,11 +34,11 @@ class HeksherService(SingleEndpointService, RunMixin):
         self.network = anonymous_network(docker_client)
         self.postgres_service.connect(self.network, aliases=['postgres'])
         self.network.connect(self.heksher, aliases=['heksher'])
-        self.network.connect(self.heksher_db_migrator, aliases=['heksher-db-migrator'])
-        super().__init__((self.heksher_db_migrator, self.heksher), **kwargs)
+        super().__init__((self.heksher, ), **kwargs)
 
     def start(self, retry_spec: Optional[RetrySpec] = None):
         self.postgres_service.start()
+        self._run_db_migration()
         super().start()
         retry_spec = retry_spec or RetrySpec(attempts=20)
         retry_spec.retry(
@@ -59,10 +53,8 @@ class HeksherService(SingleEndpointService, RunMixin):
         # difference in default signal
         self.postgres_service.disconnect(self.network)
         self.network.disconnect(self.heksher)
-        self.network.disconnect(self.heksher_db_migrator)
         self.network.remove()
         self.postgres_service.stop(signal)
-        self.heksher_db_migrator.remove(v=True)
         super().stop(signal)
 
     @property
@@ -112,3 +104,15 @@ class HeksherService(SingleEndpointService, RunMixin):
             (await self.http_client.delete(f'/api/v1/rules/{rule_id}')).raise_for_status()
         for setting_name in settings_names:
             (await self.http_client.delete(f'/api/v1/settings/{setting_name}')).raise_for_status()
+
+    def _run_db_migration(self):
+        heksher_db_migrator = self.container_creator.create_and_pull(
+            self.heksher_image, "alembic upgrade head", publish_all_ports=True, detach=True, environment={
+                'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
+            }
+        )
+        self.network.connect(heksher_db_migrator, aliases=['heksher-db-migrator'])
+        heksher_db_migrator.start()
+        heksher_db_migrator.stop()
+        self.network.disconnect(heksher_db_migrator)
+        heksher_db_migrator.remove(v=True)
