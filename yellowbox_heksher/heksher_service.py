@@ -1,5 +1,4 @@
-from asyncio import get_event_loop
-from typing import List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import httpx
 import requests  # type: ignore
@@ -12,24 +11,39 @@ from yellowbox.retry import RetrySpec
 from yellowbox.subclasses import RunMixin, SingleContainerService
 from yellowbox.utils import docker_host_name
 
+try:
+    from yellowbox.subclasses import AsyncRunMixin  # async mixins only available in yellowbox 7.1
+except ImportError:
+    class AsyncRunMixin:  # type: ignore[no-redef]
+        # a dummy class we can base the service on
+        @classmethod
+        async def arun(cls, *args, **kwargs):
+            raise NotImplementedError("AsyncRunMixin is only available in yellowbox 7.1")
 
-class HeksherService(SingleContainerService, RunMixin):
+
+class HeksherService(SingleContainerService, RunMixin, AsyncRunMixin):
     def __init__(self, docker_client: DockerClient, postgres_image: str = 'postgres:latest',
-                 heksher_image: str = 'biocatchltd/heksher:0.4.1', port: int = 0, *,
-                 heksher_startup_context_features: str, **kwargs):
+                 heksher_image: str = 'biocatchltd/heksher:latest', port: int = 0, *,
+                 heksher_startup_context_features: Union[str, Sequence[str], None] = None, **kwargs):
         self.heksher_image = heksher_image
         self.docker_client = docker_client
 
         self.postgres_service = PostgreSQLService(docker_client, image=postgres_image, default_db='heksher')
 
+        heksher_env = {
+            'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
+        }
+        if isinstance(heksher_startup_context_features, Iterable) \
+                and not isinstance(heksher_startup_context_features, str):
+            heksher_env['HEKSHER_STARTUP_CONTEXT_FEATURES'] = ';'.join(heksher_startup_context_features)
+        elif heksher_startup_context_features is not None:
+            heksher_env['HEKSHER_STARTUP_CONTEXT_FEATURES'] = heksher_startup_context_features
+
         self.heksher = create_and_pull(
-            docker_client, heksher_image, publish_all_ports=True, ports={80: port}, detach=True, environment={
-                'HEKSHER_DB_CONNECTION_STRING': self.postgres_service.container_connection_string("postgres"),
-                'HEKSHER_STARTUP_CONTEXT_FEATURES': heksher_startup_context_features,
-            }
+            docker_client, heksher_image, publish_all_ports=True, ports={80: port}, detach=True, environment=heksher_env
         )
 
-        self.http_client: Optional[httpx.AsyncClient] = None
+        self.http_client: Optional[httpx.Client] = None
 
         self.network = anonymous_network(docker_client)
         self.postgres_service.connect(self.network, aliases=['postgres'])
@@ -45,12 +59,24 @@ class HeksherService(SingleContainerService, RunMixin):
             lambda: requests.get(self.local_url + '/api/health', timeout=3).raise_for_status(),  # type: ignore
             (ConnectionError, HTTPError, exceptions.ConnectionError)
         )
-        self.http_client = httpx.AsyncClient(base_url=self.local_url)
+        self.http_client = httpx.Client(base_url=self.local_url)
+        return self
+
+    async def astart(self, retry_spec: Optional[RetrySpec] = None):
+        await self.postgres_service.astart()
+        self._run_db_migration()
+        super().start()
+        retry_spec = retry_spec or RetrySpec(attempts=20)
+        await retry_spec.aretry(
+            lambda: requests.get(self.local_url + '/api/health', timeout=3).raise_for_status(),  # type: ignore
+            (ConnectionError, HTTPError, exceptions.ConnectionError)
+        )
+        self.http_client = httpx.Client(base_url=self.local_url)
         return self
 
     def stop(self, signal='SIGKILL'):
-        get_event_loop().run_until_complete(self.http_client.aclose())
         # difference in default signal
+        self.http_client.close()
         self.postgres_service.disconnect(self.network)
         self.network.disconnect(self.heksher)
         self.network.remove()
@@ -73,37 +99,42 @@ class HeksherService(SingleContainerService, RunMixin):
     def _single_endpoint(self):
         return self.heksher
 
-    async def get_rules(self, setting_names: Optional[Sequence[str]] = None):
+    def get_rules(self, setting_names: Optional[Sequence[str]] = None) -> Dict[str, List[Any]]:
         """
         Args:
             setting_names: the settings names to retrieve the rules for, will retrieve all rules for all settings
             if None
         """
-        setting_names = setting_names or await self.get_setting_names()
-        request_data = {
-            "setting_names": setting_names,
-            "context_features_options": "*",
+        params: Dict[str, Any] = {
             "include_metadata": True,
         }
-        response = await self.http_client.post('/api/v1/rules/query', json=request_data)
+        if setting_names is not None:
+            params['settings'] = ','.join(setting_names)
+        response = self.http_client.get('/api/v1/query', params=params)
         response.raise_for_status()
         result = response.json()
-        return result["rules"]
+        return {setting: data['rules'] for setting, data in result['settings'].items()}
 
-    async def get_setting_names(self) -> List[str]:
-        response = await self.http_client.get('/api/v1/settings', params={"include_additional_data": False})
+    def get_setting_names(self) -> List[str]:
+        response = self.http_client.get('/api/v1/settings', params={"include_additional_data": False})
         response.raise_for_status()
         result = response.json()
         return [s['name'] for s in result["settings"]]
 
-    async def clear(self):
-        settings_names = await self.get_setting_names()
-        rules = await self.get_rules(settings_names)
-        rules_ids = [rule["rule_id"] for config_rules in rules.values() for rule in config_rules]
-        for rule_id in rules_ids:
-            (await self.http_client.delete(f'/api/v1/rules/{rule_id}')).raise_for_status()
+    def clear_settings(self):
+        settings_names = self.get_setting_names()
         for setting_name in settings_names:
-            (await self.http_client.delete(f'/api/v1/settings/{setting_name}')).raise_for_status()
+            (self.http_client.delete(f'/api/v1/settings/{setting_name}')).raise_for_status()
+
+    def clear_rules(self):
+        rules = self.get_rules()
+        rules_ids = [rule["rule_id"] for ruleset in rules.values() for rule in ruleset]
+        for rule_id in rules_ids:
+            (self.http_client.delete(f'/api/v1/rules/{rule_id}')).raise_for_status()
+
+    def clear(self):
+        self.clear_rules()
+        self.clear_settings()
 
     def _run_db_migration(self):
         heksher_db_migrator = create_and_pull(
