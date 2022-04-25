@@ -6,6 +6,7 @@
 ### Added
 * added async startup to the service
 * `clear_rules`, `clear_settings` methods
+* add support for python 3.10
 ### Fixed
 * run `alembic upgrade head` in a separate container before starting Heksher
 * Fixed closing of httpx client
