@@ -16,5 +16,5 @@ class CreateRuleParams(BaseModel):
 async def declare_settings_inner(heksher_url):
     heksher = AsyncHeksherClient(heksher_url, update_interval=60, context_features=["cid"])
     await heksher.set_as_main()  # we only want to declare settings
-    await heksher.close()
+    await heksher.aclose()
     heksher_main_client.Main = TemporaryClient()

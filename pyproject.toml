@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "yellowbox-heksher"
-version = "0.2.1"
+version = "0.2.2"
 description = ""
 authors = ["Biocatch LTD <serverteam@biocatch.com>"]
 license = "MIT"
@@ -15,7 +15,7 @@ pytest = "*"
 pytest-asyncio = "*"
 flake8 = "*"
 isort = "^5.9.1"
-mypy = "^0.902"
+mypy = "^0.950"
 heksher = ">=0.2.1"
 pytest-cov = "*"
 yellowbox = { version = ">=0.7.1", extras = ["postgresql"] }
